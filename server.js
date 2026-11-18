@@ -10,7 +10,25 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 
 const CLIENT_DIR = path.resolve(__dirname, 'dist/client');
-const SERVER_ENTRY = path.resolve(__dirname, 'dist/server/index.js');
+
+// TanStack Start builds to server.js when targeting Node; index.js when targeting edge/workers.
+// Check all potential output filenames.
+const candidateServerEntries = [
+  path.resolve(__dirname, 'dist/server/server.js'),
+  path.resolve(__dirname, 'dist/server/index.js'),
+  path.resolve(__dirname, 'dist/server/server.mjs'),
+  path.resolve(__dirname, 'dist/server/index.mjs'),
+];
+
+const SERVER_ENTRY = candidateServerEntries.find((p) => fs.existsSync(p));
+
+// Verify production build existence
+if (!SERVER_ENTRY) {
+  console.error(`[Server] Error: No server entry file found in dist/server/`);
+  console.error(`[Server] Looked for: ${candidateServerEntries.map((p) => path.basename(p)).join(', ')}`);
+  console.error(`[Server] Please run 'npm run build' before starting the server.`);
+  process.exit(1);
+}
 
 // Standard MIME types for web assets
 const MIME_TYPES = {
@@ -33,38 +51,60 @@ const MIME_TYPES = {
   '.xml': 'application/xml; charset=utf-8',
 };
 
-// Verify production build existence
-if (!fs.existsSync(SERVER_ENTRY)) {
-  console.error(`[Server] Error: Server entry not found at ${SERVER_ENTRY}`);
-  console.error(`[Server] Please run 'npm run build' before starting the server.`);
-  process.exit(1);
-}
-
 // Dynamically load the compiled TanStack Start server entry
-let serverHandler;
+let fetchHandler = null;
 try {
+  console.log(`[Server] Loading server entry from ${SERVER_ENTRY}...`);
   const mod = await import(SERVER_ENTRY);
-  serverHandler = mod.default || mod;
-  if (typeof serverHandler.fetch !== 'function' && typeof mod.createServerEntry === 'function') {
-    // If default is not the handler object directly, check if createServerEntry is exported
-    serverHandler = mod.default?.fetch ? mod.default : mod;
+  const candidate = mod.default || mod;
+
+  if (typeof candidate?.fetch === 'function') {
+    fetchHandler = candidate.fetch.bind(candidate);
+  } else if (typeof candidate === 'function') {
+    fetchHandler = candidate;
+  } else if (typeof mod.fetch === 'function') {
+    fetchHandler = mod.fetch.bind(mod);
+  } else if (typeof mod.createServerEntry === 'function') {
+    const entry = mod.createServerEntry();
+    fetchHandler = typeof entry?.fetch === 'function' ? entry.fetch.bind(entry) : entry;
   }
 } catch (err) {
   console.error('[Server] Fatal: Failed to load server entry module:', err);
   process.exit(1);
 }
 
-function getSafeFilePath(clientDir, urlPath) {
+if (!fetchHandler) {
+  console.error('[Server] Fatal: Could not resolve a fetch handler from', SERVER_ENTRY);
+  process.exit(1);
+}
+
+function resolveStaticFile(clientDir, urlPath) {
   try {
     const decodedPath = decodeURIComponent(urlPath.split('?')[0]);
     const safePath = path.normalize(decodedPath).replace(/^(\.\.[/\\])+/, '');
-    const candidatePath = path.join(clientDir, safePath);
+    const candidate = path.join(clientDir, safePath);
 
-    // Prevent directory traversal outside of CLIENT_DIR
-    if (!candidatePath.startsWith(clientDir)) {
-      return null;
+    // Prevent directory traversal outside of clientDir
+    if (!candidate.startsWith(clientDir)) return null;
+
+    // Direct file match (e.g. /assets/styles-DCtaurYn.css, /favicon.png)
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+      return candidate;
     }
-    return candidatePath;
+
+    // Prerendered HTML file match (e.g. /blog -> /blog.html)
+    const htmlCandidate = candidate + '.html';
+    if (fs.existsSync(htmlCandidate) && fs.statSync(htmlCandidate).isFile()) {
+      return htmlCandidate;
+    }
+
+    // Directory index match (e.g. / -> /index.html)
+    const indexCandidate = path.join(candidate, 'index.html');
+    if (fs.existsSync(indexCandidate) && fs.statSync(indexCandidate).isFile()) {
+      return indexCandidate;
+    }
+
+    return null;
   } catch {
     return null;
   }
@@ -83,50 +123,50 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Attempt to serve static client asset if available in dist/client
+    // Attempt to serve static or pre-rendered asset from dist/client
     if (fs.existsSync(CLIENT_DIR)) {
-      const candidatePath = getSafeFilePath(CLIENT_DIR, pathname);
-      if (candidatePath && fs.existsSync(candidatePath)) {
-        const stat = fs.statSync(candidatePath);
-        if (stat.isFile()) {
-          const ext = path.extname(candidatePath).toLowerCase();
-          const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+      const staticFile = resolveStaticFile(CLIENT_DIR, pathname);
+      if (staticFile) {
+        const stat = fs.statSync(staticFile);
+        const ext = path.extname(staticFile).toLowerCase();
+        const contentType = MIME_TYPES[ext] || 'application/octet-stream';
 
-          // Cache control: immutable for hashed build assets, standard for other static files
-          if (pathname.startsWith('/assets/')) {
-            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-          } else {
-            res.setHeader('Cache-Control', 'public, max-age=3600');
-          }
+        // Cache control: immutable for hashed build assets, shorter for HTML/other assets
+        if (pathname.startsWith('/assets/')) {
+          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        } else if (ext === '.html') {
+          res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
+        } else {
+          res.setHeader('Cache-Control', 'public, max-age=3600');
+        }
 
-          // ETag validation
-          const etag = `"${stat.size}-${stat.mtimeMs}"`;
-          res.setHeader('ETag', etag);
+        // ETag validation
+        const etag = `"${stat.size}-${stat.mtimeMs}"`;
+        res.setHeader('ETag', etag);
 
-          if (req.headers['if-none-match'] === etag) {
-            res.statusCode = 304;
-            res.end();
-            return;
-          }
-
-          res.writeHead(200, {
-            'Content-Type': contentType,
-            'Content-Length': stat.size,
-          });
-
-          if (req.method === 'HEAD') {
-            res.end();
-            return;
-          }
-
-          const stream = fs.createReadStream(candidatePath);
-          stream.pipe(res);
+        if (req.headers['if-none-match'] === etag) {
+          res.statusCode = 304;
+          res.end();
           return;
         }
+
+        res.writeHead(200, {
+          'Content-Type': contentType,
+          'Content-Length': stat.size,
+        });
+
+        if (req.method === 'HEAD') {
+          res.end();
+          return;
+        }
+
+        const stream = fs.createReadStream(staticFile);
+        stream.pipe(res);
+        return;
       }
     }
 
-    // SSR & API routing through TanStack Start's Web API fetch handler
+    // SSR & dynamic request routing through TanStack Start's fetch handler
     const protocol = req.headers['x-forwarded-proto'] || 'http';
     const host = req.headers['x-forwarded-host'] || req.headers.host || `${HOST}:${PORT}`;
     const fullUrl = `${protocol}://${host}${rawUrl}`;
@@ -158,7 +198,7 @@ const server = http.createServer(async (req, res) => {
       duplex: body ? 'half' : undefined,
     });
 
-    const webResponse = await serverHandler.fetch(webRequest);
+    const webResponse = await fetchHandler(webRequest);
 
     res.statusCode = webResponse.status;
     webResponse.headers.forEach((val, key) => {
