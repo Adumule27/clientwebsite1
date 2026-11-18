@@ -18,12 +18,13 @@ The application is pre-configured for seamless deployment as a **conventional No
    - **Language / Runtime**: `Node`
    - **Region**: Choose the region closest to your audience (e.g., `Oregon`, `Frankfurt`)
    - **Branch**: `main`
-   - **Build Command**: `npm install && npm run build`
+   - **Build Command**: `npm install --include=dev && npm run build`
    - **Start Command**: `npm start`
 5. Under **Environment Variables**, add:
    | Key | Value | Description |
    | --- | --- | --- |
    | `NODE_ENV` | `production` | Enables production mode |
+   | `NODE_VERSION` | `22` | Specifies Node.js 22 LTS |
    | `VITE_SUPABASE_URL` | `https://bbdzywucatlypfisyymi.supabase.co` | Your Supabase Project URL |
    | `VITE_SUPABASE_PUBLISHABLE_KEY` | `sb_publishable_kNh0v5x9bkaIOA_sZ3GdwQ_Bydmi9R-` | Your Supabase Anon/Publishable Key |
 6. Under **Advanced** → **Health Check Path**, enter: `/healthz`
